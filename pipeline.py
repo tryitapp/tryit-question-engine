@@ -1,20 +1,24 @@
 """
 TryIT Question Engine — Main Pipeline
 ========================================
-Run this file. It pulls today's job list from quota_tracker (crowded
-topics first), and for each job: generates -> parses -> decency-checks
--> dedup-checks -> verifies with two independent models -> writes a
-local JSON batch file -> pushes the verified rows to Supabase.
+Run this file. It pulls today's job list from quota_tracker (highest
+coverage_score first, sourced from real Supabase data), and for each
+job: generates -> parses -> decency-checks -> dedup-checks -> verifies
+with two independent models -> writes a local JSON batch file -> pushes
+the verified rows to Supabase, matching your REAL questions table schema.
 
 Usage:
-    python pipeline.py                  # run the full crowded-first queue
+    python pipeline.py                  # run the full priority-ordered queue
     python pipeline.py --max-jobs 5     # just a handful, for testing
     python pipeline.py --report         # print quota progress and exit
     python pipeline.py --dry-run        # generate+verify but don't push to Supabase
+
+NOTE on exam_tags: this still writes an empty list for exam_tags on every
+record. Wiring real exam_topic_weightage data in is a separate next step
+(needs to confirm that table actually has data first) — not faked here.
 """
 
 import os
-import sys
 import json
 import time
 import uuid
@@ -24,8 +28,9 @@ from datetime import datetime, timezone
 import requests
 
 from config import (
-    TOPICS, EXAMS, LEVELS, PROVIDER_MODELS,
-    QUALITY_SCORE_THRESHOLD, JSON_BATCH_SIZE,
+    LEVELS, PROVIDER_MODELS, QUALITY_SCORE_THRESHOLD, JSON_BATCH_SIZE,
+    DIAGRAM_KIND_BY_TOPIC_ID, DEFAULT_ACCESS_TIER, DEFAULT_PATTERN_TYPE,
+    difficulty_label_for_level,
 )
 from content_rules import (
     COPYRIGHT_INSTRUCTION, build_explanation_prompt_block, DECENCY_RULES,
@@ -39,28 +44,40 @@ from providers import (
 )
 from dedup import filter_duplicates
 from quota_tracker import build_today_jobs, progress_report
+from supabase_data import fetch_topic_by_id, fetch_subjects
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 PENDING_REVIEW_PATH = os.path.join(OUTPUT_DIR, "pending_review.jsonl")
+
+
+def _topic_and_subject(topic_id: str):
+    """Fetches real topic + subject metadata once per job. Raises a
+    clear error if the topic_id doesn't actually exist in Supabase,
+    rather than silently generating against nothing."""
+    topic = fetch_topic_by_id(topic_id)
+    if not topic:
+        raise ValueError(f"topic_id '{topic_id}' not found in Supabase topics table")
+    subjects = fetch_subjects()
+    subject = subjects.get(topic["subject_id"], {})
+    return topic, subject
 
 
 # ──────────────────────────────────────────────────────────
 # STAGE A — GENERATION
 # ──────────────────────────────────────────────────────────
 def build_generation_prompt(topic_id: str, level: int, count: int) -> str:
-    meta = TOPICS[topic_id]
+    topic, subject = _topic_and_subject(topic_id)
     level_desc = LEVELS.get(level, "competitive level")
-    exam_list = ", ".join(meta["exam_tags"])
+    diagram_kind = DIAGRAM_KIND_BY_TOPIC_ID.get(topic_id)
 
     diagram_block = ""
-    if meta.get("diagram_required") and meta.get("auto_generate", True):
-        diagram_block = "\n" + diagram_instruction_for(meta["diagram_kind"]) + "\n"
+    if topic.get("is_visual") and diagram_kind:
+        diagram_block = "\n" + diagram_instruction_for(diagram_kind) + "\n"
 
     return f"""You are an expert Indian competitive exam question writer.
 
-SUBJECT: {meta['subject']} | CHAPTER: {meta['chapter']} | TOPIC: {meta['topic']}
+SUBJECT: {subject.get('subject_name', topic['subject_id'])} | TOPIC: {topic['topic_name']}
 DIFFICULTY LEVEL: {level} ({level_desc})
-RELEVANT EXAMS: {exam_list}
 NUMBER OF QUESTIONS: {count}
 
 {COPYRIGHT_INSTRUCTION}
@@ -96,10 +113,6 @@ def generate_batch(topic_id: str, level: int, count: int):
 
 # ──────────────────────────────────────────────────────────
 # GEOMETRY-FIRST PATH — paper folding & embedded figures
-# Code constructs the geometry (and therefore the correct answer) FIRST.
-# The LLM is only asked to write question text and explanations around
-# a scenario whose answer is already fixed — it never invents geometry,
-# so there's nothing for it to get wrong on the visual/correctness side.
 # ──────────────────────────────────────────────────────────
 GEOMETRY_GENERATORS = {
     "paper_fold": geometry_engine.generate_paper_fold_geometry,
@@ -108,7 +121,7 @@ GEOMETRY_GENERATORS = {
 
 
 def build_geometry_first_prompt(topic_id: str, level: int, scenarios: list) -> str:
-    meta = TOPICS[topic_id]
+    topic, subject = _topic_and_subject(topic_id)
     level_desc = LEVELS.get(level, "competitive level")
     items_desc = "\n".join(
         f"{i + 1}. {s['scenario_text']} The correct option is option "
@@ -119,7 +132,7 @@ def build_geometry_first_prompt(topic_id: str, level: int, scenarios: list) -> s
 
     return f"""You are an expert Indian competitive exam question writer.
 
-SUBJECT: {meta['subject']} | CHAPTER: {meta['chapter']} | TOPIC: {meta['topic']}
+SUBJECT: {subject.get('subject_name', topic['subject_id'])} | TOPIC: {topic['topic_name']}
 DIFFICULTY LEVEL: {level} ({level_desc})
 
 {COPYRIGHT_INSTRUCTION}
@@ -152,12 +165,8 @@ are already fixed):
 
 
 def generate_geometry_first_batch(topic_id: str, level: int, count: int):
-    """Builds `count` geometry scenarios with code (correct answer fixed
-    by construction), then makes ONE batched LLM call for just the text
-    fields, and merges them back together. Returns a list of merged
-    question dicts ready for the decency/dedup/diagram-gate stages."""
-    meta = TOPICS[topic_id]
-    generator_fn = GEOMETRY_GENERATORS[meta["diagram_kind"]]
+    diagram_kind = DIAGRAM_KIND_BY_TOPIC_ID[topic_id]
+    generator_fn = GEOMETRY_GENERATORS[diagram_kind]
 
     geometries = [generator_fn() for _ in range(count)]
     scenarios = [
@@ -172,8 +181,6 @@ def generate_geometry_first_batch(topic_id: str, level: int, count: int):
 
     text_items = parse_questions(text)
     if len(text_items) != len(geometries):
-        # Model didn't return one item per scenario — keep whatever pairs
-        # we can match positionally, drop the rest rather than guess.
         n = min(len(text_items), len(geometries))
         text_items, geometries = text_items[:n], geometries[:n]
 
@@ -181,7 +188,7 @@ def generate_geometry_first_batch(topic_id: str, level: int, count: int):
     for text_fields, geom in zip(text_items, geometries):
         q = dict(text_fields)
         q["options"] = ["Option A", "Option B", "Option C", "Option D"]
-        q["correct_answer"] = geom["correct_answer"]  # forced by construction, not by the LLM
+        q["correct_answer"] = geom["correct_answer"]
         q["diagram_svg"] = geom["diagram_svg"]
         q["option_svgs"] = geom["option_svgs"]
         q["diagram_meta"] = geom["diagram_meta"]
@@ -190,8 +197,6 @@ def generate_geometry_first_batch(topic_id: str, level: int, count: int):
 
 
 def parse_questions(raw_text: str):
-    """Extracts a JSON array from a model response, tolerating markdown
-    fences and stray text before/after the array."""
     if not raw_text:
         return []
     text = raw_text.strip()
@@ -199,29 +204,31 @@ def parse_questions(raw_text: str):
     start = text.find("[")
     end = text.rfind("]") + 1
     if start == -1 or end <= start:
+        if start != -1:
+            print(f"   [parse] found '[' but no closing ']' at all in {len(text)} chars — "
+                  f"almost certainly TRUNCATED mid-output (hit the token limit). "
+                  f"Last 150 chars: {text[-150:]!r}")
+        else:
+            print(f"   [parse] no JSON array found anywhere — response started with: {text[:150]!r}")
         return []
     try:
         result = json.loads(text[start:end])
         return result if isinstance(result, list) else []
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        tail = text[max(0, end - 200):end]
+        print(f"   [parse] JSON error: {e}")
+        print(f"   [parse] response length {len(text)} chars — last 200 chars before the closing ']': {tail!r}")
+        if not tail.rstrip().endswith("}"):
+            print("   [parse] looks TRUNCATED (doesn't end cleanly on a closing brace) — "
+                  "likely hit the model's output token limit for this batch size")
         return []
 
 
-# ──────────────────────────────────────────────────────────
-# STAGE B — DECENCY / SAFETY CHECK (fast keyword pass)
-# Real protection is the AI verification stage below asking the model
-# directly; this is just a cheap tripwire that costs no API call.
-# ──────────────────────────────────────────────────────────
 def decency_tripwire(question: dict) -> bool:
-    """Returns True if the question looks SAFE (passes), False if it
-    should be dropped/flagged."""
     blob = json.dumps(question).lower()
     return not any(bad in blob for bad in PROFANITY_TRIPWIRE_EN)
 
 
-# ──────────────────────────────────────────────────────────
-# STAGE C — VERIFICATION (two independent models, not one)
-# ──────────────────────────────────────────────────────────
 def build_verification_prompt(question: dict) -> str:
     return f"""Check this exam question for correctness and quality.
 
@@ -243,8 +250,6 @@ explanation quality (2pts), cultural relevance (2pts), uniqueness (2pts).
 
 
 def verify_question(question: dict):
-    """Runs two independent verification calls. Returns
-    (passed: bool, quality_score: int, needs_human_review: bool)."""
     prompt = build_verification_prompt(question)
 
     text1, _ = call_with_failover(prompt, VERIFICATION_CHAIN_1,
@@ -261,15 +266,14 @@ def verify_question(question: dict):
     avg_score = sum(scores) / len(scores) if scores else 0
 
     if any_factual_error:
-        return False, avg_score, False  # straight reject, not worth a human review slot
+        return False, avg_score, False
 
     if votes_correct == 2:
         passed = avg_score >= QUALITY_SCORE_THRESHOLD
         return passed, avg_score, False
     if votes_correct == 1:
-        # verifiers disagree — route to human review instead of auto-deciding
         return False, avg_score, True
-    return False, avg_score, False  # 0/2 — reject
+    return False, avg_score, False
 
 
 def _parse_verification(text):
@@ -286,54 +290,36 @@ def _parse_verification(text):
 
 
 # ──────────────────────────────────────────────────────────
-# STAGE D — OUTPUT (local JSON batches + Supabase push)
+# STAGE D — OUTPUT — matches your REAL questions table schema exactly
 # ──────────────────────────────────────────────────────────
-def to_final_record(question: dict, topic_id: str, level: int) -> dict:
-    meta = TOPICS[topic_id]
-    exam_mapping = {}
-    for exam_id in meta["exam_tags"]:
-        exam_meta = EXAMS.get(exam_id, {})
-        exam_mapping[exam_id] = {
-            "pattern": exam_meta.get("pattern", "standalone_mcq4"),
-            "negative_marking": exam_meta.get("negative_marking"),
-            "time_allowed_seconds": exam_meta.get("time_per_q_sec"),
-        }
+def to_final_record(question: dict, topic_id: str, level: int, provider: str) -> dict:
+    topic, _ = _topic_and_subject(topic_id)
+    diagram_kind = DIAGRAM_KIND_BY_TOPIC_ID.get(topic_id)
+    has_visual = bool(topic.get("is_visual") and diagram_kind)
 
-    diagram_kind = meta.get("diagram_kind")
-    diagram_payload = None
-    if diagram_kind == "chart_data":
-        diagram_payload = {"kind": "chart_data", "data": question.get("chart_data")}
-    elif diagram_kind == "geometry_svg":
-        diagram_payload = {
-            "kind": "geometry_svg",
-            "svg": question.get("diagram_svg"),
-            "meta": question.get("diagram_meta"),
-        }
-    elif diagram_kind == "nonverbal_mirror_svg":
-        diagram_payload = {
-            "kind": "nonverbal_mirror_svg",
-            "original_svg": question.get("original_svg"),
-            "option_svgs": question.get("option_svgs"),
-        }
-    elif diagram_kind in ("paper_fold", "embedded_figure"):
-        diagram_payload = {
-            "kind": diagram_kind,
-            "diagram_svg": question.get("diagram_svg"),   # the "before" figure shown with the question
-            "option_svgs": question.get("option_svgs"),   # the 4 answer-choice figures
-            "meta": question.get("diagram_meta"),
-        }
-    elif diagram_kind == "map_region":
-        diagram_payload = {"kind": "map_region", "map_data": question.get("map_data")}
+    visual_type, visual_data = None, None
+    if has_visual:
+        visual_type = diagram_kind
+        if diagram_kind == "chart_data":
+            visual_data = question.get("chart_data")
+        elif diagram_kind == "geometry_svg":
+            visual_data = {"svg": question.get("diagram_svg"), "meta": question.get("diagram_meta")}
+        elif diagram_kind == "nonverbal_mirror_svg":
+            visual_data = {"original_svg": question.get("original_svg"), "option_svgs": question.get("option_svgs")}
+        elif diagram_kind in ("paper_fold", "embedded_figure"):
+            visual_data = {
+                "diagram_svg": question.get("diagram_svg"),
+                "option_svgs": question.get("option_svgs"),
+                "meta": question.get("diagram_meta"),
+            }
 
     return {
         "id": f"q_{uuid.uuid4().hex[:16]}",
-        "created": datetime.now(timezone.utc).isoformat(),
         "topic_id": topic_id,
-        "subject": meta["subject"],
-        "chapter": meta["chapter"],
-        "topic": meta["topic"],
+        "subject_id": topic["subject_id"],
         "level": level,
-        "tier": meta["tier"],
+        "difficulty": difficulty_label_for_level(level),
+        "pattern_type": DEFAULT_PATTERN_TYPE,
         "question_en": question.get("question", ""),
         "options_en": question.get("options", []),
         "correct_answer": question.get("correct_answer", 0),
@@ -346,14 +332,18 @@ def to_final_record(question: dict, topic_id: str, level: int) -> dict:
             "shortcut_tips": question.get("shortcut_tips", ""),
             "cross_exam_intelligence": question.get("cross_exam_intelligence", ""),
         },
-        "diagram_required": meta.get("diagram_required", False),
-        "diagram": diagram_payload,  # None for text-only topics; validated payload otherwise
-        "exam_mapping": exam_mapping,
-        "exam_tags": meta["exam_tags"],
+        "translations": {},
+        "exam_tags": [],
+        "has_visual": has_visual,
+        "visual_type": visual_type,
+        "visual_data": visual_data,
+        "access_tier": DEFAULT_ACCESS_TIER,
+        "copyright_original": True,
         "verified": True,
         "quality_score": question.get("_quality_score", 0),
-        "copyright_original": True,
-        "translations": {},  # filled in by a separate translation pass — see README
+        "report_count": 0,
+        "generated_by": f"tryit_engine:{provider}",
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -390,7 +380,7 @@ def push_to_supabase(records: list) -> int:
             if r.status_code in (200, 201):
                 saved += len(batch)
             else:
-                print(f"  [supabase] error {r.status_code}: {r.text[:150]}")
+                print(f"  [supabase] error {r.status_code}: {r.text[:200]}")
         except requests.RequestException as e:
             print(f"  [supabase] request failed: {e}")
     return saved
@@ -409,8 +399,14 @@ def append_pending_review(question: dict, topic_id: str, level: int, reason: str
 def process_job(topic_id: str, level: int, count: int, dry_run: bool = False) -> dict:
     print(f"\n-> {topic_id} | L{level} | requesting {count}")
 
-    meta = TOPICS[topic_id]
-    is_geometry_first = meta.get("diagram_kind") in GEOMETRY_GENERATORS
+    try:
+        topic, _ = _topic_and_subject(topic_id)
+    except ValueError as e:
+        print(f"   x {e}")
+        return {"generated": 0, "verified": 0, "saved": 0}
+
+    diagram_kind = DIAGRAM_KIND_BY_TOPIC_ID.get(topic_id)
+    is_geometry_first = diagram_kind in GEOMETRY_GENERATORS
 
     if is_geometry_first:
         questions, provider = generate_geometry_first_batch(topic_id, level, count)
@@ -430,18 +426,10 @@ def process_job(topic_id: str, level: int, count: int, dry_run: bool = False) ->
             return {"generated": 0, "verified": 0, "saved": 0}
         print(f"   generated {len(questions)} via {provider}")
 
-    # decency tripwire — drop silently, don't even send these to verification
     questions = [q for q in questions if decency_tripwire(q)]
-
-    # in-batch duplicate filter
     questions = filter_duplicates(questions, text_key="question")
 
-    # diagram gate — if this topic requires a diagram, a question without
-    # a VALID one (checked computationally, not just "is the field present")
-    # is rejected outright. A geometry question with no figure, or a wrong
-    # figure, is worse than no question at all.
-    if meta.get("diagram_required") and meta.get("auto_generate", True):
-        diagram_kind = meta["diagram_kind"]
+    if topic.get("is_visual") and diagram_kind:
         before = len(questions)
         questions = [q for q in questions if validate_diagram(q, diagram_kind)]
         dropped = before - len(questions)
@@ -457,7 +445,7 @@ def process_job(topic_id: str, level: int, count: int, dry_run: bool = False) ->
         if not passed:
             continue
         q["_quality_score"] = score
-        verified_records.append(to_final_record(q, topic_id, level))
+        verified_records.append(to_final_record(q, topic_id, level, provider))
 
     print(f"   verified {len(verified_records)}/{len(questions)} (threshold {QUALITY_SCORE_THRESHOLD}/10)")
 
@@ -477,10 +465,10 @@ def process_job(topic_id: str, level: int, count: int, dry_run: bool = False) ->
 # ──────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--max-jobs", type=int, default=None, help="limit number of jobs this run (use to fit a GitHub Actions time window)")
+    parser.add_argument("--max-jobs", type=int, default=None)
     parser.add_argument("--questions-per-job", type=int, default=15)
-    parser.add_argument("--dry-run", action="store_true", help="generate + verify but skip the Supabase push")
-    parser.add_argument("--report", action="store_true", help="print quota progress and exit, no generation")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--report", action="store_true")
     args = parser.parse_args()
 
     if args.report:
@@ -490,7 +478,7 @@ def main():
     jobs = build_today_jobs(questions_per_job=args.questions_per_job, max_jobs=args.max_jobs)
     print("=" * 60)
     print(f"TryIT Question Engine — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Jobs queued this run: {len(jobs)} (crowded tier first)")
+    print(f"Jobs queued this run: {len(jobs)} (highest coverage_score first)")
     print("=" * 60)
 
     totals = {"generated": 0, "verified": 0, "saved": 0}
@@ -498,7 +486,7 @@ def main():
         result = process_job(topic_id, level, count, dry_run=args.dry_run)
         for k in totals:
             totals[k] += result[k]
-        time.sleep(1)  # gentle pacing between jobs, on top of per-provider backoff
+        time.sleep(1)
 
     print("\n" + "=" * 60)
     print(f"DONE. generated={totals['generated']} verified={totals['verified']} saved={totals['saved']}")
