@@ -83,7 +83,7 @@ PROVIDER_MODELS = {
     "groq_fast":  "llama-3.1-8b-instant",
     "groq_strong":"gpt-oss-120b-versatile",
     "gemini":     "gemini-2.5-flash",
-    "openrouter": "meta-llama/gpt-oss-120b-instruct:free",
+    "openrouter": "meta-llama/llama-3.3-70b-instruct:free",
     "mistral":    "mistral-small-latest",
 }
 
