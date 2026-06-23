@@ -81,9 +81,9 @@ DIAGRAM_KIND_BY_TOPIC_ID = _build_diagram_kind_lookup()
 PROVIDER_MODELS = {
     "cerebras":   "gpt-oss-120b",
     "groq_fast":  "llama-3.1-8b-instant",
-    "groq_strong":"llama-3.3-70b-versatile",
+    "groq_strong":"gpt-oss-120b-versatile",
     "gemini":     "gemini-2.5-flash",
-    "openrouter": "meta-llama/llama-3.3-70b-instruct:free",
+    "openrouter": "meta-llama/gpt-oss-120b-instruct:free",
     "mistral":    "mistral-small-latest",
 }
 
