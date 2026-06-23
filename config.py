@@ -79,7 +79,7 @@ DIAGRAM_KIND_BY_TOPIC_ID = _build_diagram_kind_lookup()
 # PROVIDER MODEL DEFAULTS
 # ──────────────────────────────────────────────────────────
 PROVIDER_MODELS = {
-    "cerebras":   "llama-3.3-70b",
+    "cerebras":   "gpt-oss-120b",
     "groq_fast":  "llama-3.1-8b-instant",
     "groq_strong":"llama-3.3-70b-versatile",
     "gemini":     "gemini-2.5-flash",
