@@ -29,8 +29,8 @@ import requests
 
 from config import (
     LEVELS, PROVIDER_MODELS, QUALITY_SCORE_THRESHOLD, JSON_BATCH_SIZE,
-    DIAGRAM_KIND_BY_TOPIC_ID, DEFAULT_ACCESS_TIER, DEFAULT_PATTERN_TYPE,
-    difficulty_label_for_level,
+    DIAGRAM_KIND_BY_TOPIC_ID, DEFAULT_PATTERN_TYPE,
+    difficulty_label_for_level, access_tier_for_level,
 )
 from content_rules import (
     COPYRIGHT_INSTRUCTION, build_explanation_prompt_block, DECENCY_RULES,
@@ -337,7 +337,7 @@ def to_final_record(question: dict, topic_id: str, level: int, provider: str) ->
         "has_visual": has_visual,
         "visual_type": visual_type,
         "visual_data": visual_data,
-        "access_tier": DEFAULT_ACCESS_TIER,
+        "access_tier": access_tier_for_level(level),
         "copyright_original": True,
         "verified": True,
         "quality_score": question.get("_quality_score", 0),

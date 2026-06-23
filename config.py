@@ -81,7 +81,7 @@ DIAGRAM_KIND_BY_TOPIC_ID = _build_diagram_kind_lookup()
 PROVIDER_MODELS = {
     "cerebras":   "gpt-oss-120b",
     "groq_fast":  "llama-3.1-8b-instant",
-    "groq_strong":"gpt-oss-120b-versatile",
+    "groq_strong":"llama-3.3-70b-versatile",
     "gemini":     "gemini-2.5-flash",
     "openrouter": "meta-llama/llama-3.3-70b-instruct:free",
     "mistral":    "mistral-small-latest",
@@ -89,5 +89,11 @@ PROVIDER_MODELS = {
 
 QUALITY_SCORE_THRESHOLD = 7  # out of 10
 JSON_BATCH_SIZE = 300        # questions per output JSON file
-DEFAULT_ACCESS_TIER = "free"        # assumption — adjust if you already have a tiering convention
+def access_tier_for_level(level: int) -> str:
+    """Free tier: Easy/Medium (levels 1-6) — PYQ-based practice plus
+    AI-generated questions at this range. Hard/Expert (levels 7-10)
+    require Pro or Ultra subscription. Ultra is a superset of Pro, so
+    "pro" is the correct minimum tier to write here — Ultra subscribers
+    get access to anything Pro does automatically on the app side."""
+    return "free" if level <= 6 else "pro"
 DEFAULT_PATTERN_TYPE = "standalone_mcq4"  # assumption — adjust per topic/exam pattern as needed
